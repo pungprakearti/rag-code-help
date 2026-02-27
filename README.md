@@ -28,9 +28,9 @@ npm install
 
 ### 3. Usage
 
-By default, the script looks for a file named sampleCode.tsx in the root directory. Once your file is in place, run:
+By default, the script looks for a directory called sampleCode in the root directory. Once your directory is in place, run:
 ```
-node codeHelp.mjs
+node mitey.mjs
 ```
 
 ### 🔍 Troubleshooting
