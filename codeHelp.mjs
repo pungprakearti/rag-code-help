@@ -2,9 +2,14 @@ import { OllamaEmbeddings, ChatOllama } from "@langchain/ollama";
 import { HNSWLib } from "@langchain/community/vectorstores/hnswlib";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import fs from "fs/promises";
+import path from "path";
+import readline from "readline";
 
 const OLLAMA_URL = "http://127.0.0.1:11434";
+const SRC_DIRECTORY = "./sampleCode";
+const DB_PATH = "./local_index_data";
 
+// --- Setup AI Models ---
 const embeddings = new OllamaEmbeddings({
   model: "nomic-embed-text",
   baseUrl: OLLAMA_URL,
@@ -16,81 +21,130 @@ const model = new ChatOllama({
   baseUrl: OLLAMA_URL,
 });
 
-const FILE_PATH = "./sampleCode.tsx";
-const DB_PATH = "./local_index_data";
-
+// --- Utilities ---
 const getElapsed = (start) => ((performance.now() - start) / 1000).toFixed(2);
 
+async function getFiles(dir) {
+  const dirents = await fs.readdir(dir, { withFileTypes: true });
+  const files = await Promise.all(
+    dirents.map((dirent) => {
+      const res = path.resolve(dir, dirent.name);
+      return dirent.isDirectory() ? getFiles(res) : res;
+    }),
+  );
+  return Array.prototype.concat(...files);
+}
+
+const askQuestion = (query) => {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  return new Promise((resolve) =>
+    rl.question(query, (ans) => {
+      rl.close();
+      resolve(ans);
+    }),
+  );
+};
+
+// --- Main Execution ---
 const runLocalAI = async () => {
   try {
     const totalStart = performance.now();
 
-    // 1. Read the code file and split into chunks
+    // 1. Ingestion Phase
     const step1Start = performance.now();
-    console.log("Reading file...");
-    const rawCode = await fs.readFile(FILE_PATH, "utf-8");
+    console.log(`Scanning directory: ${SRC_DIRECTORY}...`);
 
+    const allFilePaths = await getFiles(SRC_DIRECTORY);
+    const validExtensions = [".tsx", ".ts", ".js", ".jsx", ".md"];
+
+    const docs = [];
     const splitter = new RecursiveCharacterTextSplitter({
       chunkSize: 800,
       chunkOverlap: 100,
     });
-    const docs = await splitter.createDocuments(
-      [rawCode],
-      [{ source: FILE_PATH }],
-    );
+
+    for (const filePath of allFilePaths) {
+      if (validExtensions.includes(path.extname(filePath))) {
+        const content = await fs.readFile(filePath, "utf-8");
+        const fileDocs = await splitter.createDocuments(
+          [content],
+          [{ source: path.relative(process.cwd(), filePath) }],
+        );
+        docs.push(...fileDocs);
+      }
+    }
+
+    const allFileNames = [...new Set(docs.map((d) => d.metadata.source))];
     console.log(
-      `⏱️  Split into ${docs.length} chunks: ${getElapsed(step1Start)}s`,
+      `⏱️  Processed ${docs.length} chunks from ${allFileNames.length} files: ${getElapsed(step1Start)}s`,
     );
 
-    // 2. Send chunks to Ollama for embedding and to save in local database
+    // 2. Vector Indexing
     const step2Start = performance.now();
-    console.log("Analyzing and saving to local database...");
+    console.log("Updating local vector database...");
     const vectorStore = await HNSWLib.fromDocuments(docs, embeddings);
     await vectorStore.save(DB_PATH);
-    console.log(`⏱️  Embedding & Saving (GPU): ${getElapsed(step2Start)}s`);
+    console.log(`⏱️  Vector DB Updated: ${getElapsed(step2Start)}s`);
 
-    // 3. Searching for relevant chunks based on user query
+    // 3. User Interaction Phase
+    console.log("\n--- Local Code RAG Ready ---");
+    const userQuery = await askQuestion(
+      "What would you like to know about these files? ",
+    );
+
+    if (!userQuery) return;
+
+    // 4. Smart Retrieval (Hybrid Search)
     const step3Start = performance.now();
-    const userQuery =
-      "Tell me about each block of this file. Summarize what each block is doing.";
-    console.log(`Data Saved! Now asking the query: ${userQuery}`);
+    let context = "";
 
-    const savedStore = await HNSWLib.load(DB_PATH, embeddings);
+    // Check if user is asking for a specific file by name
+    const mentionedFile = allFileNames.find((name) =>
+      userQuery.toLowerCase().includes(path.basename(name).toLowerCase()),
+    );
 
-    const searchResults = await savedStore.similaritySearch(userQuery, 2);
-    const context = searchResults.map((res) => res.pageContent).join("\n---\n");
+    if (mentionedFile) {
+      console.log(`Direct Match Found: Fetching ${mentionedFile} from disk...`);
+      // Fail-safe: Read the actual file to ensure the AI sees 100% of it
+      const fullContent = await fs.readFile(
+        path.join(process.cwd(), mentionedFile),
+        "utf-8",
+      );
+      context = `[File: ${mentionedFile}]\n${fullContent}`;
+    } else {
+      const savedStore = await HNSWLib.load(DB_PATH, embeddings);
+      const searchResults = await savedStore.similaritySearch(userQuery, 6);
+      context = searchResults
+        .map((res) => `[File: ${res.metadata.source}]\n${res.pageContent}`)
+        .join("\n---\n");
+    }
+
     console.log(`⏱️  Context Retrieval: ${getElapsed(step3Start)}s`);
 
-    // 4. Get AI response
+    // 5. AI Response
     const step4Start = performance.now();
-    const claudeLikePrompt = `Act as a highly skilled, thoughtful, and concise assistant. Your goal is to provide helpful, intellectually honest,
-        and nuanced responses while maintaining a natural, conversational tone. Please adhere to the following stylistic guidelines:
+    const systemPrompt = `Act as a highly skilled, thoughtful, and concise assistant. 
+        You are analyzing a project containing these files: ${allFileNames.join(", ")}.
 
-        Be Direct: Avoid lengthy introductions, flowery transitions, or concluding summaries unless they add genuine value. Start directly with the answer.
-
-        Tone and Style: Use a professional yet warm and understated tone. Avoid over-the-top enthusiasm or repetitive 'AI-isms' like "As an AI language
-            model" or "It is important to remember."
-
-        Intellectual Honesty: If a topic is complex, acknowledge the nuances. If you are unsure about a fact, state your uncertainty clearly rather than guessing.
-
-        Coding Philosophy: When writing code, prioritize readability and modern best practices. Provide brief, meaningful comments rather than explaining
-            every single line of syntax.
-
-        Conciseness: Value the user's time. If a question can be answered in two sentences, do not write five. Use bullet points for readability but keep
-            the prose around them lean.`;
+        Start directly with the answer. Use a professional yet warm tone. 
+        If full file content is provided in the context, use it to answer precisely.
+        Clearly state which file you are referring to.`;
 
     const response = await model.invoke([
-      ["system", `${claudeLikePrompt}`],
-      [
-        "user",
-        `Here is the relevant code:\n${context}\n\nQuestion: ${userQuery}`,
-      ],
+      ["system", systemPrompt],
+      ["user", `Retrieved context:\n${context}\n\nQuestion: ${userQuery}`],
     ]);
-    console.log(`⏱️  AI Response Generation: ${getElapsed(step4Start)}s`);
 
     console.log("\nAI Results:");
+    console.log("--------------------------------------------------");
     console.log(response.content);
-    console.log(`\n✅ Total Process Time: ${getElapsed(totalStart)}s`);
+    console.log("--------------------------------------------------");
+
+    console.log(`\n✅ AI Response Generation: ${getElapsed(step4Start)}s`);
+    console.log(`✅ Total Session Time: ${getElapsed(totalStart)}s`);
   } catch (error) {
     console.error("Error:", error.message);
   }

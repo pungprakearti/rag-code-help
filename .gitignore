@@ -59,3 +59,4 @@ npm-debug.log*
 coverage/
 .nyc_output
 local_index_data
+sampleCode
